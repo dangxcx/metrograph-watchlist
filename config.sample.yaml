@@ -1,0 +1,22 @@
+# Metrograph Watchlist Configuration Sample
+# Copy this file to config.yaml and add your API keys
+
+tmdb:
+  api_key: "your_tmdb_api_key_here"
+
+radarr:
+  host: "http://localhost:7878"
+  api_key: "your_radarr_api_key_here"
+  root_folder_path: "/movies"
+  quality_profile_id: 1
+  monitored: true
+  search_for_movie: true
+
+agregarr:
+  host: "http://localhost:3000"
+  api_key: "your_agregarr_api_key_here"
+
+# Optional settings
+settings:
+  rate_limit_ms: 250
+  debug: true
