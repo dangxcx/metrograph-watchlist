@@ -55,14 +55,11 @@ type Collection struct {
 
 	// Download and search automation
 	SearchMissingMovies bool   `json:"searchMissingMovies,omitempty"` // Auto-request missing movies
-	SearchMissingTV     bool   `json:"searchMissingTV,omitempty"`     // Auto-request missing TV shows
 	AutoApproveMovies   bool   `json:"autoApproveMovies,omitempty"`   // Auto-approve movie requests
-	AutoApproveTV       bool   `json:"autoApproveTV,omitempty"`       // Auto-approve TV show requests
 	DownloadMode        string `json:"downloadMode,omitempty"`        // "overseerr" or "direct"
 
 	// Radarr/Sonarr instance settings
-	RadarrInstanceID               string `json:"radarrInstanceId,omitempty"`               // Radarr instance ID for direct mode
-	SonarrInstanceID               string `json:"sonarrInstanceId,omitempty"`               // Sonarr instance ID for direct mode
+	RadarrInstanceID               int    `json:"radarrInstanceId"`                         // Radarr instance ID for direct mode
 	DirectDownloadRadarrProfileID  int    `json:"directDownloadRadarrProfileId,omitempty"`  // Radarr quality profile ID
 	DirectDownloadRadarrRootFolder string `json:"directDownloadRadarrRootFolder,omitempty"` // Radarr root folder path
 	RadarrTagID                    int    `json:"radarrTagId,omitempty"`                    // Radarr tag ID for the collection
@@ -274,7 +271,7 @@ func CreateCollectionsFromJSON(jsonFile string, radarrConfig RadarrConfig, agreg
 			SearchMissingMovies: true,     // Auto-request missing movies
 			AutoApproveMovies:   true,     // Auto-approve movie requests
 			DownloadMode:        "direct", // Use direct Radarr integration (not Overseerr)
-			RadarrInstanceID:    "0",      // Radarr instance ID (0 for first instance)
+			RadarrInstanceID:    0,        // Radarr instance ID (0 for first instance)
 
 			// Direct download Radarr settings
 			DirectDownloadRadarrProfileID:  radarrConfig.QualityProfileID, // Quality profile ID from config
@@ -293,4 +290,3 @@ func CreateCollectionsFromJSON(jsonFile string, radarrConfig RadarrConfig, agreg
 
 	return nil
 }
-
