@@ -2,6 +2,7 @@ package metrograph
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -66,20 +67,26 @@ type Collection struct {
 }
 
 func NewAgregarrClient(config AgregarrConfig) *AgregarrClient {
+	// Create HTTP client with TLS verification disabled (like curl -k)
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
 	return &AgregarrClient{
 		config: AgregarrConfig{
 			Host:   config.Host,
 			APIKey: config.APIKey,
 		},
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: tr,
 		},
 	}
 }
 
 func (a *AgregarrClient) makeRequest(method, endpoint string, body any) (*http.Response, error) {
 	url := fmt.Sprintf("%s/api/v1/%s", a.config.Host, endpoint)
-	var reqBody *bytes.Buffer
+	var reqBody io.Reader
 	if body != nil {
 		jsonData, err := json.Marshal(body)
 		if err != nil {
@@ -169,12 +176,40 @@ func (a *AgregarrClient) GetCollections() ([]Collection, error) {
 
 	fmt.Printf("Collections response: %s\n", string(body)[:min(1000, len(body))])
 
-	var collections []Collection
-	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&collections); err != nil {
+	// API returns {"collectionConfigs": [...]} not just [...]
+	var response struct {
+		CollectionConfigs []Collection `json:"collectionConfigs"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&response); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	return collections, nil
+	return response.CollectionConfigs, nil
+}
+
+func (a *AgregarrClient) DeleteCollection(collectionID string) error {
+	endpoint := fmt.Sprintf("collections/%s", collectionID)
+	fmt.Printf("Deleting collection %s via DELETE %s\n", collectionID, endpoint)
+
+	resp, err := a.makeRequest("DELETE", endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("request error for %s: %v", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	fmt.Printf("Response status for DELETE %s: %d\n", endpoint, resp.StatusCode)
+
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) > 0 {
+		fmt.Printf("Response body: %s\n", string(body))
+	}
+
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("failed to delete collection %s: HTTP %d - %s", collectionID, resp.StatusCode, string(body))
+	}
+
+	fmt.Printf("Successfully deleted collection %s\n", collectionID)
+	return nil
 }
 
 func (a *AgregarrClient) TestConnection() error {
@@ -206,14 +241,90 @@ func (a *AgregarrClient) TestConnection() error {
 	return nil
 }
 
+func SyncCollectionsFromJSON(jsonFile string, radarrConfig RadarrConfig, agregarrConfig AgregarrConfig) error {
+	data, err := os.ReadFile(jsonFile)
+	if err != nil {
+		return fmt.Errorf("failed to read JSON file %s: %w", jsonFile, err)
+	}
+
+	var scrapedData ScrapedData
+	if err := json.Unmarshal(data, &scrapedData); err != nil {
+		return fmt.Errorf("failed to parse JSON file %s: %w", jsonFile, err)
+	}
+
+	agregarrClient := NewAgregarrClient(agregarrConfig)
+	radarrClient, err := NewRadarrClient(radarrConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create Radarr client: %w", err)
+	}
+
+	// Get existing collections from Agregarr
+	existingCollections, err := agregarrClient.GetCollections()
+	if err != nil {
+		return fmt.Errorf("failed to get existing collections: %w", err)
+	}
+
+	fmt.Printf("Syncing collections from %s (scraped on %s)\n", jsonFile, scrapedData.Date)
+
+	// Build a set of expected collection names from the JSON file
+	expectedNames := make(map[string]bool)
+	results := scrapedData.Collections
+	for _, series := range results {
+		// Count valid movies
+		validMovies := 0
+		for _, movie := range series.Movies {
+			if movie.TMDBID > 0 {
+				validMovies++
+			}
+		}
+
+		// Only include series with enough valid movies
+		if validMovies >= 2 {
+			collectionName := fmt.Sprintf("Metrograph: %s", series.Name)
+			expectedNames[collectionName] = true
+		}
+	}
+
+	// Find and delete collections that are no longer in the JSON file
+	deletedCollectionCount := 0
+	deletedTagCount := 0
+	for _, collection := range existingCollections {
+		// Only consider collections that start with "Metrograph: "
+		if len(collection.Name) > 12 && collection.Name[:12] == "Metrograph: " {
+			if !expectedNames[collection.Name] {
+				fmt.Printf("Deleting collection '%s' (no longer in JSON file)\n", collection.Name)
+
+				// Delete from Agregarr
+				if err := agregarrClient.DeleteCollection(collection.ID); err != nil {
+					fmt.Printf("Warning: Failed to delete collection '%s': %v\n", collection.Name, err)
+				} else {
+					deletedCollectionCount++
+				}
+
+				// Delete corresponding Radarr tag (Subtype contains the tag name like "metrograph-12345")
+				if collection.Subtype != "" && len(collection.Subtype) > 11 && collection.Subtype[:11] == "metrograph-" {
+					if err := radarrClient.DeleteTag(collection.Subtype); err != nil {
+						fmt.Printf("Warning: Failed to delete Radarr tag '%s': %v\n", collection.Subtype, err)
+					} else {
+						deletedTagCount++
+					}
+				}
+			}
+		}
+	}
+
+	fmt.Printf("Deleted %d obsolete collection(s) and %d Radarr tag(s)\n", deletedCollectionCount, deletedTagCount)
+	return nil
+}
+
 func CreateCollectionsFromJSON(jsonFile string, radarrConfig RadarrConfig, agregarrConfig AgregarrConfig) error {
 	data, err := os.ReadFile(jsonFile)
 	if err != nil {
 		return fmt.Errorf("failed to read JSON file %s: %w", jsonFile, err)
 	}
 
-	var results map[string]Series
-	if err := json.Unmarshal(data, &results); err != nil {
+	var scrapedData ScrapedData
+	if err := json.Unmarshal(data, &scrapedData); err != nil {
 		return fmt.Errorf("failed to parse JSON file %s: %w", jsonFile, err)
 	}
 
@@ -224,7 +335,8 @@ func CreateCollectionsFromJSON(jsonFile string, radarrConfig RadarrConfig, agreg
 
 	agregarrClient := NewAgregarrClient(agregarrConfig)
 
-	fmt.Printf("Creating collections from %d series in %s\n", len(results), jsonFile)
+	fmt.Printf("Creating collections from %d series in %s (scraped on %s)\n", len(scrapedData.Collections), jsonFile, scrapedData.Date)
+	results := scrapedData.Collections
 	for seriesID, series := range results {
 		// Count valid movies
 		validMovies := 0

@@ -1,9 +1,12 @@
 package metrograph
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	"golift.io/starr"
 	"golift.io/starr/radarr"
@@ -24,8 +27,19 @@ type RadarrClient struct {
 }
 
 func NewRadarrClient(config RadarrConfig) (*RadarrClient, error) {
-	starr := starr.New(config.APIKey, config.Host, 0)
-	client := radarr.New(starr)
+	// Create HTTP client with TLS verification disabled (like curl -k)
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	httpClient := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: tr,
+	}
+
+	// Create starr config with custom HTTP client
+	starrConfig := starr.New(config.APIKey, config.Host, 0)
+	starrConfig.Client = httpClient
+	client := radarr.New(starrConfig)
 
 	return &RadarrClient{
 		client: client,
@@ -59,21 +73,41 @@ func (r *RadarrClient) CreateTag(name string) (int, error) {
 	return int(createdTag.ID), nil
 }
 
+func (r *RadarrClient) GetMovieByTMDBID(tmdbID int) (*radarr.Movie, error) {
+	// Get all movies and find the one matching this TMDB ID
+	movies, err := r.client.GetMovie(&radarr.GetMovie{
+		TMDBID: int64(tmdbID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get movies: %w", err)
+	}
+	if len(movies) == 0 {
+		return nil, fmt.Errorf("movie with TMDB ID %d not found", tmdbID)
+	}
+
+	return movies[0], nil
+}
+
+func (r *RadarrClient) UpdateMovieTags(movieID int64, newTagIDs []int) error {
+	// Get the movie first
+	movie, err := r.client.GetMovieByID(movieID)
+	if err != nil {
+		return fmt.Errorf("failed to get movie: %w", err)
+	}
+
+	// Update tags
+	movie.Tags = newTagIDs
+
+	// Update the movie (requires: id, movie object, moveFiles bool)
+	_, err = r.client.UpdateMovie(movieID, movie, false)
+	if err != nil {
+		return fmt.Errorf("failed to update movie: %w", err)
+	}
+
+	return nil
+}
+
 func (r *RadarrClient) AddMovie(tmdbID int, title string, year int, tagIDs []int) error {
-	// Check if movie already exists by looking up via TMDB ID
-	// Skip the check for now and let Radarr handle duplicates
-	// movies, err := r.client.GetMovies()
-	// if err != nil {
-	//     return fmt.Errorf("failed to get existing movies: %w", err)
-	// }
-
-	// for _, movie := range movies {
-	//     if movie.TmdbID == int64(tmdbID) {
-	//         fmt.Printf("Movie '%s' (%d) already exists in Radarr\n", title, year)
-	//         return nil
-	//     }
-	// }
-
 	// Create new movie
 	addMovieInput := &radarr.AddMovieInput{
 		Title:            title,
@@ -90,11 +124,65 @@ func (r *RadarrClient) AddMovie(tmdbID int, title string, year int, tagIDs []int
 
 	addedMovie, err := r.client.AddMovie(addMovieInput)
 	if err != nil {
+		// Check if the error is because the movie already exists
+		errMsg := err.Error()
+		if containsAny(errMsg, []string{"already been added", "already exists"}) {
+			fmt.Printf("Movie '%s' (%d) already exists in Radarr, adding tags...\n", title, year)
+
+			// Get the existing movie
+			existingMovie, err := r.GetMovieByTMDBID(tmdbID)
+			if err != nil {
+				return fmt.Errorf("failed to get existing movie: %w", err)
+			}
+
+			// Merge tags (avoid duplicates)
+			existingTagMap := make(map[int]bool)
+			for _, tagID := range existingMovie.Tags {
+				existingTagMap[tagID] = true
+			}
+
+			// Add new tags that don't already exist
+			updatedTags := existingMovie.Tags
+			addedCount := 0
+			for _, tagID := range tagIDs {
+				if !existingTagMap[tagID] {
+					updatedTags = append(updatedTags, tagID)
+					addedCount++
+				}
+			}
+
+			if addedCount > 0 {
+				// Update the movie with the new tags
+				err = r.UpdateMovieTags(existingMovie.ID, updatedTags)
+				if err != nil {
+					return fmt.Errorf("failed to update tags for existing movie: %w", err)
+				}
+				fmt.Printf("Added %d new tag(s) to existing movie '%s' (%d)\n", addedCount, title, year)
+			} else {
+				fmt.Printf("Movie '%s' (%d) already has all specified tags\n", title, year)
+			}
+			return nil
+		}
+
 		return fmt.Errorf("failed to add movie '%s' (%d): %w", title, year, err)
 	}
 
 	fmt.Printf("Added movie '%s' (%d) to Radarr with ID %d\n", title, year, addedMovie.ID)
 	return nil
+}
+
+// Helper function to check if a string contains any of the given substrings
+func containsAny(s string, substrs []string) bool {
+	for _, substr := range substrs {
+		if len(s) >= len(substr) {
+			for i := 0; i <= len(s)-len(substr); i++ {
+				if s[i:i+len(substr)] == substr {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (r *RadarrClient) GetTagIDByName(tagName string) (int, error) {
@@ -112,14 +200,31 @@ func (r *RadarrClient) GetTagIDByName(tagName string) (int, error) {
 	return 0, fmt.Errorf("tag '%s' not found in Radarr", tagName)
 }
 
+func (r *RadarrClient) DeleteTag(tagName string) error {
+	// Get the tag ID first
+	tagID, err := r.GetTagIDByName(tagName)
+	if err != nil {
+		return err // Tag doesn't exist, which is fine
+	}
+
+	// Delete the tag by ID
+	err = r.client.DeleteTag(tagID)
+	if err != nil {
+		return fmt.Errorf("failed to delete tag '%s' (ID %d): %w", tagName, tagID, err)
+	}
+
+	fmt.Printf("Deleted Radarr tag '%s' (ID %d)\n", tagName, tagID)
+	return nil
+}
+
 func ProcessJSONToRadarr(jsonFile string, config RadarrConfig) error {
 	data, err := os.ReadFile(jsonFile)
 	if err != nil {
 		return fmt.Errorf("failed to read JSON file %s: %w", jsonFile, err)
 	}
 
-	var results map[string]Series
-	if err := json.Unmarshal(data, &results); err != nil {
+	var scrapedData ScrapedData
+	if err := json.Unmarshal(data, &scrapedData); err != nil {
 		return fmt.Errorf("failed to parse JSON file %s: %w", jsonFile, err)
 	}
 
@@ -128,7 +233,8 @@ func ProcessJSONToRadarr(jsonFile string, config RadarrConfig) error {
 		return fmt.Errorf("failed to create Radarr client: %w", err)
 	}
 
-	fmt.Printf("Processing %d series from %s\n", len(results), jsonFile)
+	fmt.Printf("Processing %d series from %s (scraped on %s)\n", len(scrapedData.Collections), jsonFile, scrapedData.Date)
+	results := scrapedData.Collections
 
 	for seriesID, series := range results {
 		// Count valid movies (those with TMDB IDs)
@@ -189,4 +295,3 @@ func ListRadarrProfiles(config RadarrConfig) error {
 
 	return nil
 }
-

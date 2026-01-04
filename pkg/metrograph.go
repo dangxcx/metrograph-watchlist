@@ -3,8 +3,10 @@ package metrograph
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,6 +29,11 @@ type Series struct {
 	URL    string
 	ID     string
 	Movies []Film
+}
+
+type ScrapedData struct {
+	Date        string            `json:"date"`
+	Collections map[string]Series `json:"collections"`
 }
 
 const BASE string = "https://metrograph.com"
@@ -257,17 +264,6 @@ func Crawl(tmdbAPIKey string) (map[string]Series, error) {
 					}
 				}
 			}
-
-			// Search TMDB for movie
-			if tmdbAPIKey != "" {
-				if tmdbMovie, err := SearchTMDB(m.Title, m.Year, tmdbAPIKey); err == nil {
-					m.TMDBID = tmdbMovie.ID
-					fmt.Printf("Found TMDB ID for %s: %d\n", m.Title, m.TMDBID)
-				} else {
-					fmt.Printf("TMDB lookup failed for %s: %v\n", m.Title, err)
-				}
-			}
-
 			movieList = append(movieList, m)
 		}
 
@@ -276,4 +272,101 @@ func Crawl(tmdbAPIKey string) (map[string]Series, error) {
 	}
 
 	return results, err
+}
+
+func populateIMDBID(films []Film, tmdbAPIKey string) {
+	// Search TMDB for movie
+	for i := range films {
+		if tmdbAPIKey != "" {
+			if tmdbMovie, err := SearchTMDB(films[i].Title, films[i].Year, tmdbAPIKey); err == nil {
+				films[i].TMDBID = tmdbMovie.ID
+				fmt.Printf("Found TMDB ID for %s: %d\n", films[i].Title, films[i].TMDBID)
+			} else {
+				fmt.Printf("TMDB lookup failed for %s: %v\n", films[i].Title, err)
+			}
+		}
+	}
+}
+
+func UpdateFileStore(scrappedData map[string]Series, curFilePath string) error {
+	data, err := os.ReadFile(curFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to read JSON file %s: %w", curFilePath, err)
+	}
+
+	var fileData ScrapedData
+	if err := json.Unmarshal(data, &fileData); err != nil {
+		return fmt.Errorf("failed to parse JSON file %s: %w", curFilePath, err)
+	}
+
+	for id, s := range scrappedData {
+		if col, ok := fileData.Collections[id]; ok {
+			merged := dedupeFilms(col.Movies, s.Movies)
+			if len(merged) != len(s.Movies) {
+				fmt.Println(fmt.Sprintf("Updated series %s from %d, to %d movie", s.Name, len(s.Movies), len(merged)))
+			}
+			s.Movies = merged
+			scrappedData[id] = s
+		}
+	}
+
+	return writeToFile(scrappedData)
+}
+
+func writeToFile(scrappedSeries map[string]Series) error {
+	// Filter results to only include series with >2 valid movies for JSON output
+	filteredResults := make(map[string]Series)
+	for seriesID, series := range scrappedSeries {
+		validMovies := 0
+		for _, movie := range series.Movies {
+			if movie.TMDBID > 0 {
+				validMovies++
+			}
+		}
+		if validMovies > 2 {
+			filteredResults[seriesID] = series
+		}
+	}
+
+	// Generate filename with today's date
+	today := time.Now().Format("2006-01-02")
+	filename := fmt.Sprintf("%s.json", today)
+
+	// Create ScrapedData structure with date and collections
+	scrapedData := ScrapedData{
+		Date:        today,
+		Collections: filteredResults,
+	}
+
+	// Pretty print the JSON data
+	jsonData, err := json.MarshalIndent(scrapedData, "", "  ")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Write to file
+	err = os.WriteFile(filename, jsonData, 0644)
+	if err != nil {
+		log.Fatalf("Failed to write to %s: %v", filename, err)
+	}
+
+	fmt.Printf("Results written to %s\n", filename)
+	fmt.Printf("Found %d total series, %d series with >2 valid movies\n", len(scrappedSeries), len(filteredResults))
+	return nil
+}
+
+func dedupeFilms(colA []Film, colB []Film) []Film {
+	var results []Film
+	added := make(map[string]struct{})
+	for _, f := range colA {
+		results = append(results, f)
+		added[f.Title] = struct{}{}
+	}
+
+	for _, f := range colB {
+		if _, ok := added[f.Title]; !ok {
+			results = append(results, f)
+		}
+	}
+	return results
 }

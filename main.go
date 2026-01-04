@@ -1,11 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
-	"time"
 
 	metrograph "github.com/dangxcx/metrograph-watchlist/pkg"
 	"go.yaml.in/yaml/v4"
@@ -172,8 +170,37 @@ func main() {
 			fmt.Printf("Found %d collections\n", len(collections))
 			return
 
+		case "sync-collections":
+			if len(args) < 2 {
+				log.Fatal("Usage: go run main.go sync-collections <json-file>")
+			}
+
+			jsonFile := args[1]
+			if config.Agregarr.APIKey == "" || config.Agregarr.Host == "" {
+				log.Fatal("Agregarr configuration missing in config.yaml")
+			}
+			if config.Radarr.APIKey == "" || config.Radarr.Host == "" {
+				log.Fatal("Radarr configuration missing in config.yaml")
+			}
+
+			radarrConfig := metrograph.RadarrConfig{
+				Host:   config.Radarr.Host,
+				APIKey: config.Radarr.APIKey,
+			}
+
+			agregarrConfig := metrograph.AgregarrConfig{
+				Host:   config.Agregarr.Host,
+				APIKey: config.Agregarr.APIKey,
+			}
+
+			err := metrograph.SyncCollectionsFromJSON(jsonFile, radarrConfig, agregarrConfig)
+			if err != nil {
+				log.Fatal(err)
+			}
+			return
+
 		default:
-			log.Fatalf("Unknown command: %s\nAvailable commands: radarr, profiles, collections, test-agregarr", args[0])
+			log.Fatalf("Unknown command: %s\nAvailable commands: radarr, profiles, collections, sync-collections, test-agregarr, get-collections", args[0])
 		}
 	}
 
@@ -183,36 +210,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Filter results to only include series with >2 valid movies for JSON output
-	filteredResults := make(map[string]metrograph.Series)
-	for seriesID, series := range results {
-		validMovies := 0
-		for _, movie := range series.Movies {
-			if movie.TMDBID > 0 {
-				validMovies++
-			}
-		}
-		if validMovies > 2 {
-			filteredResults[seriesID] = series
-		}
-	}
-
-	// Generate filename with today's date
-	today := time.Now().Format("2006-01-02")
-	filename := fmt.Sprintf("%s.json", today)
-
-	// Pretty print the JSON data
-	jsonData, err := json.MarshalIndent(filteredResults, "", "  ")
+	err = metrograph.UpdateFileStore(results, "./2026-01-03.json")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Write to file
-	err = os.WriteFile(filename, jsonData, 0644)
-	if err != nil {
-		log.Fatalf("Failed to write to %s: %v", filename, err)
-	}
-
-	fmt.Printf("Results written to %s\n", filename)
-	fmt.Printf("Found %d total series, %d series with >2 valid movies\n", len(results), len(filteredResults))
 }
